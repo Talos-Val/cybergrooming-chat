@@ -1028,7 +1028,7 @@
 
     async function loadAnswerBank() {
       try {
-        const res = await fetch("answer-bank.json", { cache: "no-store" });
+        const res = await fetch("talos-val.github.io/cybergrooming-chat/answer-bank.json", { cache: "no-store" });
         if (!res.ok) throw new Error("No JSON file");
         const data = await res.json();
         if (Array.isArray(data) && data.length > 20) {
