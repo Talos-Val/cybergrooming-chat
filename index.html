@@ -615,6 +615,18 @@
        Ohne Modell läuft alles im Regelmodus weiter.
        ================================================================== */
 
+    const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    let HAS_WEBGPU = false;
+    const gpuCheck = (async () => {
+      try { HAS_WEBGPU = !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch (e) { HAS_WEBGPU = false; }
+    })();
+    // Warteschlange: Embedder und Prüfer rechnen nie gleichzeitig (halbiert die Speicherspitze auf iOS)
+    let heavyChain = Promise.resolve();
+    function heavy(fn) {
+      const run = heavyChain.then(fn, fn);
+      heavyChain = run.catch(() => {});
+      return run;
+    }
     const MODEL_ID = "Xenova/multilingual-e5-small";
     const TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
@@ -684,6 +696,7 @@
         try {
           const tf = await import(TRANSFORMERS_URL);
           tfLib = tf;
+          try { tf.env.backends.onnx.wasm.numThreads = 1; } catch (e) {}
           if (await localModelAvailable()) {
             tf.env.allowLocalModels = true;
             tf.env.allowRemoteModels = false;
@@ -702,8 +715,10 @@
             }
           });
           embedder = async texts => {
-            const out = await extractor(texts.map(t => "query: " + t), { pooling: "mean", normalize: true });
-            return out.tolist().map(v => Float32Array.from(v));
+            return heavy(async () => {
+              const out = await extractor(texts.map(t => "query: " + t), { pooling: "mean", normalize: true });
+              return out.tolist().map(v => Float32Array.from(v));
+            });
           };
           return true;
         } catch (err) {
@@ -725,8 +740,16 @@
     // SLM – läuft standardmäßig; Nutzer können es beim Laden überspringen.
     // SmolLM2-360M: ~180 MB q4, multilingual, designed for on-device use.
     // Fallback Qwen2.5-0.5B wenn SmolLM2 nicht lädt (seltener, aber besser Deutsch).
-    const SLM_PRIMARY   = "HuggingFaceTB/SmolLM2-360M-Instruct";
-    const SLM_FALLBACK  = "onnx-community/Qwen2.5-0.5B-Instruct";
+    const SLM_PRIMARY   = "onnx-community/Qwen2.5-0.5B-Instruct";
+    const SLM_FALLBACK  = "HuggingFaceTB/SmolLM2-360M-Instruct";
+    let slmFails = 0;
+    function dropReviewer(reason) {
+      console.warn("Prüfer wird abgeschaltet:", reason);
+      slmSkipped = true; reviewerReady = false;
+      try { reviewerGen && reviewerGen.dispose && reviewerGen.dispose(); } catch (e) {}
+      reviewerGen = null;
+    }
+    function clip(t, n) { t = String(t || ""); return t.length > n ? t.slice(0, n) + "…" : t; }
     const REVIEWER_ENABLED = true;           // immer aktiv (war: ?reviewer=1)
     const REVIEWER_MODEL_ID = SLM_PRIMARY;   // Alias, bleibt für reviewCandidate
     let reviewerGen   = null;
@@ -782,12 +805,19 @@
         const tf = tfLib || await import(TRANSFORMERS_URL);
         tfLib = tf;
         // Erst SmolLM2-360M versuchen, dann Qwen2.5-0.5B als Sicherheitsnetz
-        try {
-          reviewerGen = await tf.pipeline("text-generation", SLM_PRIMARY, { dtype: "q4" });
-        } catch (e1) {
-          console.warn("SmolLM2 nicht ladbar, Fallback:", e1.message);
-          reviewerGen = await tf.pipeline("text-generation", SLM_FALLBACK, { dtype: "q4" });
+        await gpuCheck;
+        const attempts = [];
+        if (HAS_WEBGPU) { attempts.push([SLM_PRIMARY, { device: "webgpu", dtype: "q4f16" }]); }
+        attempts.push([SLM_PRIMARY, { dtype: "q4" }]);
+        attempts.push([SLM_FALLBACK, { dtype: "q4" }]);
+        let lastErr = null;
+        for (const [id, opts] of attempts) {
+          try {
+            reviewerGen = await tf.pipeline("text-generation", id, opts);
+            lastErr = null; break;
+          } catch (e1) { lastErr = e1; console.warn("Prüfer-Modell nicht ladbar:", id, e1.message); }
         }
+        if (lastErr) throw lastErr;
         reviewerReady = true;
       } catch (err) {
         console.warn("SLM nicht verfügbar:", err);
@@ -807,12 +837,13 @@
       const hints = slots.map(s => SLOT_HINTS[s] ? `[${s}] = ${SLOT_HINTS[s]}` : `[${s}] = ein passendes deutsches Wort`).join(", ");
       const messages = [
         { role: "system", content: "Ergänze die Lücken in deutschen Sätzen. Antworte nur mit dem vollständigen Satz, ohne Erklärung." },
-        { role: "user", content: "Gespräch:\n" + chatContext(4) + "\n\nErgänze die Lücken (" + hints + "):\n\"" + template + "\"\nNur der fertige Satz:" }
+        { role: "user", content: "Gespräch:\n" + chatContext(3) + "\n\nErgänze die Lücken (" + hints + "):\n\"" + template + "\"\nNur der fertige Satz:" }
       ];
       try {
-        const run = reviewerGen(messages, { max_new_tokens: 24, do_sample: false });
+        const run = heavy(() => reviewerGen(messages, { max_new_tokens: 24, do_sample: false }));
         const out = await Promise.race([run, new Promise(r => setTimeout(() => r(null), 15000))]);
-        if (!out) return null;
+        if (!out) { if (++slmFails >= 2) dropReviewer("Zeitüberschreitung"); return null; }
+        slmFails = 0;
         let filled = String(out[0].generated_text.at(-1).content || "").trim();
         // Sicherheitscheck: noch offene Slots → Template verwerfen
         if (/\[[A-ZÄÖÜ]+\]/.test(filled)) return null;
@@ -827,7 +858,7 @@
 
     function chatContext(maxItems) {
       return conversation.filter(i => !i.hint).slice(-maxItems).map(i =>
-        (i.who === "bot" ? "Figur: " : "Kind: ") + (i.who === "bot" ? i.text : i.text)).join("\n");
+        (i.who === "bot" ? "Figur: " : "Kind: ") + clip(i.text, 140)).join("\n");
     }
 
     async function reviewCandidate(card) {
@@ -836,13 +867,14 @@
         if (window.__TEST_REVIEWER) return await window.__TEST_REVIEWER(chatContext(6), cand);
         const messages = [
           { role: "system", content: "Antworte nur mit JA oder NEIN." },
-          { role: "user", content: "Gespräch:\n" + chatContext(4) +
+          { role: "user", content: "Gespräch:\n" + chatContext(3) +
             (st.pendingQ ? "\n(Offene unbeantwortete Frage des Kindes: \"" + st.pendingQ.text + "\")" : "") +
             "\n\nPasst diese nächste Nachricht zum Gespräch?\n\"" + cand + "\"\nJA oder NEIN:" }
         ];
-        const run = reviewerGen(messages, { max_new_tokens: 6, do_sample: false });
+        const run = heavy(() => reviewerGen(messages, { max_new_tokens: 6, do_sample: false }));
         const out = await Promise.race([run, new Promise(r => setTimeout(() => r(null), 20000))]);
-        if (!out) return null;
+        if (!out) { if (++slmFails >= 2) dropReviewer("Zeitüberschreitung"); return null; }
+        slmFails = 0;
         const text = String(out[0].generated_text.at(-1).content || "").toUpperCase();
         if (text.includes("NEIN") || text.includes("NICHT")) return "passt_nicht";
         return (text.includes("JA") || text.includes("PASST")) ? "passt" : null;
