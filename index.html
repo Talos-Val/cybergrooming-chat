@@ -182,6 +182,13 @@
     .fbctl .intent-hint{ font-size:.82rem; opacity:.75; margin-top:2px; }
     .fbctl select{ max-width:100%; } .fbctl select.need{ outline:3px solid var(--odd); }
     .fbctl .fbctl-sep{ height:1px; background:var(--line); margin:8px 0 4px; }
+    .fbctl .other-wrap{ display:none; flex-direction:column; gap:4px; margin-top:4px; } .fbctl .other-wrap.open{ display:flex; }
+    .fbctl .other-input{
+      width:100%; max-width:280px; font:inherit; font-size:.9rem; padding:9px 14px; min-height:40px;
+      border-radius:12px; border:1px solid var(--line); background:rgba(8,12,28,.55); color:var(--ink);
+    }
+    .fbctl .other-input.need{ outline:3px solid var(--odd); }
+    .fbctl .other-count{ font-size:.78rem; opacity:.7; }
     .tester-box{ margin:20px 0; } .tester-box summary{ cursor:pointer; }
     .tester-box .trow{ display:flex; gap:14px; flex-wrap:wrap; margin:12px 0; align-items:center; }
 
@@ -1457,8 +1464,10 @@
       ["disclose", "Was von mir erzählt",        "Du hast Persönliches geteilt (Name, Wohnort, Schule, Alter …)."],
       ["probe",    "Nachgefragt wer das ist",    "Du hast misstrauisch nachgefragt (Wer bist du? Warum willst du das wissen?)."],
       ["insult",   "Zurückgekontert / gemeckert","Du hast die Person beleidigt oder zurückgeschimpft."],
-      ["soft",     "Einfach geantwortet",        "Neutrale Antwort, harmlose Frage, oder unklar was gemeint war."]
+      ["soft",     "Einfach geantwortet",        "Neutrale Antwort, harmlose Frage, oder unklar was gemeint war."],
+      ["other",    "Etwas anderes",             "Keins davon passt. Beschreibe unten kurz, was du gemeint hast."]
     ];
+    const OTHER_MAX = 20;
 
     // Immer sichtbar, ein Block pro Austausch: (1) passte die Chat-Nachricht? (2) hat der Chat dich richtig verstanden?
     const FIT_REASONS = [
@@ -1522,6 +1531,27 @@
         pick.appendChild(el("div", "intent-hint", "Was hast du gemeint? Wähle eine Kategorie:"));
         const grid = el("div", "intent-grid open");
         const descEl = el("div", "intent-hint", "");
+
+        // Freitext für „Etwas anderes“ (max. 20 Zeichen)
+        const otherWrap = el("div", "other-wrap");
+        const otherInput = document.createElement("input");
+        otherInput.type = "text"; otherInput.className = "other-input";
+        otherInput.maxLength = OTHER_MAX;
+        otherInput.placeholder = "Was hast du gemeint?";
+        otherInput.setAttribute("aria-label", "Was hast du gemeint? (max. " + OTHER_MAX + " Zeichen)");
+        const otherCount = el("div", "other-count", "0 / " + OTHER_MAX);
+        otherInput.addEventListener("input", () => {
+          const t = otherInput.value.trim();
+          me.corrected_other = t || null;
+          otherCount.textContent = otherInput.value.length + " / " + OTHER_MAX;
+          if (t) otherInput.classList.remove("need");
+        });
+        otherWrap.append(otherInput, otherCount);
+        const setOtherVisible = (on) => {
+          otherWrap.classList.toggle("open", on);
+          if (!on) { otherInput.value = ""; otherInput.classList.remove("need"); otherCount.textContent = "0 / " + OTHER_MAX; me.corrected_other = null; }
+        };
+
         INTENT_CHIPS.forEach(([val, label, desc]) => {
           const c = el("button", "chip", label); c.type = "button";
           c.addEventListener("click", () => {
@@ -1529,15 +1559,18 @@
             descEl.textContent = desc;
             me.corrected = val; me.verdict = "wrong";
             bNo.classList.add("on-no"); bYes.classList.remove("on-yes");
+            setOtherVisible(val === "other");
+            if (val === "other") otherInput.focus();
           });
           grid.appendChild(c);
         });
-        pick.append(grid, descEl);
+        pick.append(grid, descEl, otherWrap);
 
         bYes.addEventListener("click", () => {
           me.verdict = "ok"; me.corrected = null;
           bYes.classList.add("on-yes"); bNo.classList.remove("on-no");
           pick.style.display = "none"; clearOn(grid); descEl.textContent = "";
+          setOtherVisible(false);
         });
         bNo.addEventListener("click", () => {
           me.verdict = "wrong";
@@ -1577,6 +1610,8 @@
             corrected: it.verdict === "wrong" ? (it.corrected || null)
                      : it.verdict === "ok"    ? (it.intent   || null)
                      : null,
+            // Freitext (max. 20 Zeichen), nur wenn corrected === "other"
+            corrected_other: it.verdict === "wrong" && it.corrected === "other" ? (it.corrected_other || null) : null,
             reaction: it.ben,
             aside: it.fact || it.ack || null,
             topic_miss: !!it.topic_miss,
@@ -1596,8 +1631,8 @@
 
     function downloadExport() {
       const data = buildExport();
-      const open = data.turns.filter(t => t.verdict === "wrong" && !t.corrected).length;
-      if (open && !confirm(open + " Antwort(en) sind als „Falsch“ markiert, aber ohne richtige Einordnung. Daraus kann der Chat nichts lernen. Trotzdem speichern?")) return;
+      const open = data.turns.filter(t => t.verdict === "wrong" && (!t.corrected || (t.corrected === "other" && !t.corrected_other))).length;
+      if (open && !confirm(open + " Antwort(en) sind als „Falsch“ markiert, aber ohne richtige Einordnung (oder bei „Etwas anderes“ ohne Beschreibung). Daraus kann der Chat nichts lernen. Trotzdem speichern?")) return;
       const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
