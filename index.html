@@ -186,7 +186,7 @@
       border-radius:22px; border-color:rgba(120,170,210,.22);
       box-shadow:0 14px 36px rgba(4,10,20,.32), inset 0 1px 0 rgba(255,255,255,.06);
     }
-    .card,.score-card,.rate,#form{ background:linear-gradient(180deg,rgba(40,62,86,.62),rgba(22,32,45,.82)); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
+    .card,.score-card,.rate,#form{ background:linear-gradient(180deg,rgba(40,62,86,.9),rgba(22,32,45,.95)); }
     #intro{ border-radius:28px; background:linear-gradient(135deg,rgba(102,192,244,.2),rgba(22,32,45,.85) 62%); }
     .bar{ background:linear-gradient(135deg,rgba(60,96,128,.7),rgba(31,49,68,.85)); }
     #log{ background:rgba(10,17,26,.72); box-shadow:inset 0 2px 14px rgba(0,0,0,.35); }
@@ -282,7 +282,7 @@
         <button id="skipModel" class="secondary">Ohne Sprachmodell starten</button>
       </div>
       <p id="loading" class="small-note hidden" style="margin-top:10px;"></p>
-      <p class="small-note" style="margin-top:12px;">Hinweis: Deine Antworten werden sofort auf deinem Gerät ausgewertet. Zusätzlich lädt der Browser beim ersten Start einmalig ein kleines Sprachmodell (ca. 120 MB), das passendere Nachrichten auswählt. Ohne diesen Download funktioniert der Chat trotzdem. Deine Nachrichten verlassen den Browser nie.</p>
+      <p class="small-note" style="margin-top:12px;">Hinweis: Deine Antworten werden sofort auf deinem Gerät ausgewertet. Es wird nichts heruntergeladen und nichts verschickt: Alles läuft direkt in deinem Browser.</p>
     </section>
 
     <section id="chat" class="hidden">
@@ -476,6 +476,9 @@
       return run;
     }
     const MODEL_ID = "Xenova/multilingual-e5-small";
+    // Das große Sprachmodell (~120 MB Download, mehrere hundert MB RAM) ist nur noch mit ?model=1 aktiv.
+    // Standard: leichter Textabgleich (siehe lexRank), der kaum Speicher braucht.
+    const USE_EMBEDDER = /[?&]model=1\b/.test(location.search);
     const TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
     /* ==================================================================
@@ -750,7 +753,7 @@
     function updateModeInfo() {
       $("modeInfo").textContent =
         (intentModel ? "Antworten verstehen: trainiertes Modell" : "Antworten verstehen: Regeln") +
-        (embedder ? " · Nachrichtenwahl: Sprachmodell" : " · Nachrichtenwahl: Zufall") +
+        (embedder ? " · Nachrichtenwahl: Sprachmodell" : " · Nachrichtenwahl: Textabgleich") +
         (reviewerReady ? " · SLM aktiv" : (slmSkipped ? " · SLM übersprungen" : " · SLM lädt"));
     }
 
@@ -814,8 +817,13 @@
 
     function loadIntentModel() {
       try {
-        const d = JSON.parse($("intent-model-json").textContent);
+        const node = $("intent-model-json");
+        const d = JSON.parse(node.textContent);
+        node.remove();       // Rohtext (~200 KB) freigeben
         d.index = new Map(d.features.map((f, i) => [f, i]));
+        d.features = null;   // wird nur noch über index gebraucht
+        d.idf = Float32Array.from(d.idf);                 // kompakter als normale Arrays
+        d.coef = d.coef.map(row => Float32Array.from(row));
         intentModel = d;
       } catch (e) {
         console.warn("Antwort-Modell nicht lesbar, Regelmodus:", e);
@@ -918,21 +926,42 @@
     }
 
     function answerQuestion(text) {
+      const key = text + "|" + conversation.length;
+      if (qMemo.key === key) return qMemo.res;
+      const res = answerQuestionRaw(text);
+      qMemo = { key, res };
+      return res;
+    }
+    function answerQuestionRaw(text) {
       const norm = normalize(text);
-      if (!isQuestionText(text)) return null;
+      const isQ = isQuestionText(text);
+      if (!isQ) return answerSmallTalk(text, norm, false);
       if (RE_SUSPICION.test(norm)) return { type: "dodge" };
-      if (RE_ASK_NAME.test(norm)) return { type: "fact", text: pick(["Ich bin " + persona.name + ".", "Ich heiße " + persona.name + "."]) };
-      if (RE_ASK_AGE.test(norm)) return { type: "fact", text: "Ich bin " + persona.age + " Jahre alt." };
-      if (RE_ASK_GAME.test(norm)) return { type: "fact", text: pick(["Am liebsten spiele ich " + persona.game + ".", "Meistens " + persona.game + "."]), clarify: true };
-      // "Welches Tier?" / "Welche Musik?" – nur wenn das aktuelle Thema NICHT Gaming ist;
-      // "Welches Spiel?" ist schon oben durch RE_ASK_GAME abgedeckt.
+      if (RE_ASK_NAME.test(norm)) return { type: "fact", text: pickFresh(["Ich bin " + persona.name + ".", "Ich heiße " + persona.name + ".", "Ich bin's, " + persona.name + "."]) };
+      if (RE_ASK_AGE.test(norm)) return { type: "fact", text: pickFresh(["Ich bin " + persona.age + " Jahre alt.", "Ich bin " + persona.age + "."]) };
+      if (RE_ASK_GAME.test(norm)) {
+        return { type: "fact", text: pickFresh(["Am liebsten spiele ich " + persona.game + ".", "Meistens " + persona.game + ".", "Hauptsächlich " + persona.game + "."]), clarify: true };
+      }
+      // Fragen zum Spiel der Figur („Welchen Modus?“, „Wie weit bist du?“)
+      if (/\b(modus|server|level|rang|rank|skin|charakter|brawler|team|verein|welt|haus|farm|map)\b/.test(norm) && GAME_FACTS[persona.game]) {
+        const f = pickFresh(GAME_FACTS[persona.game]);
+        if (f) return { type: "fact", text: f, clarify: true };
+      }
+      // Fragen zu Musik, Sport, Serien, Tieren, Essen: unabhängig vom aktuellen Thema beantworten
+      for (const t of Object.keys(TOPIC_RE)) {
+        if (TOPIC_RE[t].test(norm)) {
+          const f = pickFresh(TOPIC_FACTS[t]);
+          if (f) return { type: "fact", text: f, clarify: true };
+        }
+      }
+      // „Welches Tier?“ / „Welche Musik?“ – nur wenn das aktuelle Thema NICHT Gaming ist
       const lc = lastBotCard();
       if (lc && lc.phase === 0 && /^(welche[rsmn]?|was fur ein\w*)\b/.test(norm) && !/\b(gruppe|schule|app|server|chat|plattform|spiel|game)\b/.test(norm)) {
         const topic = lc.topic || "gaming";
-        const f = topic !== "gaming" ? pick(TOPIC_FACTS[topic] || []) : null;
+        const f = topic !== "gaming" ? pickFresh(TOPIC_FACTS[topic] || []) : null;
         if (f) return { type: "fact", text: f, clarify: true };
       }
-      return null;
+      return answerSmallTalk(text, norm, true);
     }
 
     // Nach der ersten Nachricht begrüßt und stellt sich die Figur nicht noch einmal vor
@@ -952,21 +981,106 @@
       return out.length >= 12 ? out.charAt(0).toUpperCase() + out.slice(1) : text;
     }
 
-    const ACKS = ["Ah okay.", "Cool.", "Verstehe.", "Haha, okay.", "Alles klar."];
+    // Harmlose Kleingesprächs-Bausteine der Figur. Sie kommen nie zweimal pro Chat vor (pickFresh).
+    const ACKS = ["Ah okay.", "Cool.", "Verstehe.", "Haha, okay.", "Alles klar.", "Ah, stimmt.", "Okay, cool.", "Hm, okay.",
+                  "Ach so.", "Ah, verstehe.", "Kann sein.", "Ja, kenn ich.", "Aha.", "Nice.", "Haha ja.", "Okay :)"];
+    const ACKS_POS = ["Nice.", "Cool, freut mich.", "Haha, schön.", "Super.", "Ja, passt.", "Okay, cool :)"];
+    const ACKS_NEG = ["Ah schade.", "Hm, okay.", "Kenn ich, ist manchmal so.", "Okay, verstehe."];
     // Themen für den Einstieg: Jeder Chat beginnt mit Gaming. Wer nicht spielt, bekommt ein anderes Thema.
     const TOPICS = ["musik", "sport", "serien", "tiere", "essen"];
-    const TOPIC_ACKS = ["Ah okay.", "Alles klar.", "Kein Ding.", "Okay, macht nichts."];
+    const TOPIC_ACKS = ["Ah okay.", "Alles klar.", "Kein Ding.", "Okay, macht nichts.", "Ach so, kein Problem.", "Ist doch okay.", "Gar nicht schlimm.", "Dann was anderes."];
     const TOPIC_FACTS = {
-      musik: ["Gerade viel Pop und ein bisschen Rap.", "Meistens Pop, manchmal auch Rock."],
-      sport: ["Fußball, am meisten.", "Eigentlich Fußball und manchmal Schwimmen."],
-      serien: ["Gerade eine Comedy-Serie, die ich lustig finde.", "Mal Serien, mal YouTube."],
-      tiere: ["Hunde, am liebsten.", "Hunde und Katzen eigentlich beide."],
-      essen: ["Pizza, glaube ich.", "Nudeln gehen immer."]
+      musik: ["Gerade viel Pop und ein bisschen Rap.", "Meistens Pop, manchmal auch Rock.", "Ich höre fast alles, hauptsächlich Charts.", "Playlists auf Spotify, Hauptsache laut.", "Ein bisschen Rap, ein bisschen Pop, kommt auf die Laune an."],
+      sport: ["Fußball, am meisten.", "Eigentlich Fußball und manchmal Schwimmen.", "Ich fahre gern Fahrrad und schaue Fußball.", "Basketball ist auch cool, aber ich bin nicht so gut.", "Mal Fußball, mal Inliner."],
+      serien: ["Gerade eine Comedy-Serie, die ich lustig finde.", "Mal Serien, mal YouTube.", "Viel YouTube eigentlich, Gaming-Videos und so.", "Ich schaue gern Animes, wenn Zeit ist.", "Alles Mögliche, Hauptsache lustig."],
+      tiere: ["Hunde, am liebsten.", "Hunde und Katzen eigentlich beide.", "Ich mag Katzen, aber ich darf keine haben.", "Pferde finde ich auch cool.", "Eigentlich alles mit Fell."],
+      essen: ["Pizza, glaube ich.", "Nudeln gehen immer.", "Burger, aber nur selten.", "Pizza mit viel Käse.", "Pommes zählt auch, oder?"]
     };
+    // Spielbezogene Antworten pro Figur (nur harmlose Fiktion)
+    const GAME_FACTS = {
+      "Minecraft": ["Ich baue am liebsten große Häuser.", "Meistens Überleben, manchmal Kreativ.", "Ich hab letztens eine riesige Farm gebaut."],
+      "Roblox": ["Am meisten Rollenspiele und Obbys.", "Ich spiele oft mit meinen Cousins.", "Ich mag die Obbys, die sind schwer."],
+      "Brawl Stars": ["Ich spiele am liebsten Showdown.", "Mein Lieblings-Brawler ist ein Scharfschütze.", "Ich hänge gerade bei den Trophäen fest."],
+      "FIFA": ["Ich spiele meistens Online-Spiele gegen Freunde.", "Mit meinem Lieblingsverein natürlich.", "Ich übe gerade Freistöße."],
+      "Fortnite": ["Ich spiele am liebsten im Team.", "Bauen ist nicht so mein Ding, ich spiele ohne Bauen.", "Ich schau mir lieber Tricks an, als selber zu gewinnen."]
+    };
+    const GAMES = ["minecraft", "roblox", "fortnite", "fifa", "brawl stars", "among us", "clash royale", "clash of clans", "valorant", "league of legends",
+                   "genshin", "mario", "zelda", "pokemon", "stardew", "rocket league", "call of duty", "gta", "mariokart", "mario kart", "animal crossing", "subway surfers"];
+    const SMALLTALK = [
+      { re: /\b(wie gehts|wie geht es dir|wie geht s|alles gut bei dir|alles klar bei dir|na wie ist es)\b/,
+        say: ["Gut, und dir?", "Alles gut, danke. Und bei dir?", "Passt, bisschen müde aber gut.", "Ganz gut, und selbst?", "Läuft. Und du?"] },
+      { re: /\b(was machst du( gerade| so| grad| heute)?|was machst du denn|was geht bei dir)\b/,
+        say: ["Nichts Besonderes, bisschen am Handy.", "Chille gerade ein bisschen.", "Hab gerade Pause und schreibe mit dir.", "Eigentlich nur rumhängen."] },
+      { re: /\b(seit wann (spielst|zockst)|wie lange (spielst|zockst))\b/,
+        say: ["Schon seit ein paar Jahren.", "Seit ungefähr zwei Jahren.", "Schon länger, aber nicht jeden Tag."] },
+      { re: /\b(hast du geschwister|hast du (einen|eine) (bruder|schwester)|geschwister)\b/,
+        say: ["Ich hab einen kleinen Bruder, der nervt manchmal.", "Nee, Einzelkind.", "Eine große Schwester, sie ist okay."] },
+      { re: /\b(hast du (ein|nen) (haustier|hund|katze)|haustier)\b/,
+        say: ["Nee, leider nicht. Ich wünsch mir einen Hund.", "Ja, eine Katze.", "Haben wir nicht, meine Eltern wollen das nicht."] },
+      { re: /\b(welches handy|was fur ein handy|hast du ein handy|welche konsole|spielst du (am|auf dem) (pc|handy|ps\d?|switch|tablet))\b/,
+        say: ["Meistens am Handy.", "Auf der Switch, manchmal am PC.", "Am Tablet eigentlich.", "Meistens PC."] },
+      { re: /\b(lieblingsfarbe|welche farbe)\b/,
+        say: ["Blau, glaube ich.", "Schwarz sieht cool aus.", "Grün mag ich am meisten."] },
+      { re: /\b(wie war (dein tag|die schule)|wie wars|na wie war s)\b/,
+        say: ["Ganz okay, bisschen anstrengend.", "Normal, nichts Besonderes.", "Geht so, es gab Hausaufgaben."] }
+    ];
+    const SMALLTALK_NOQ = [
+      { re: /^(hi|hey|hallo|hello|moin|servus|huhu)( \w+)?$/, say: ["Hey!", "Hi :)", "Na?", "Hey, was geht?"] },
+      { re: /\b(danke|dankeschon|thx|merci)\b/, say: ["Kein Ding.", "Gerne!", "Klar.", "Passt schon."] },
+      { re: /^(ha)+h?a?$|^(lol|xd|lmao|hehe|haha\w*)\b/, say: ["Haha ja.", "😂", "Haha, genau.", "Lol ja."] },
+      { re: /\b(langweilig|mir ist langweilig)\b/, say: ["Mir auch ein bisschen.", "Kenn ich, manchmal ist es so.", "Ja, heute ist nicht viel los."] },
+      { re: /\b(bin mude|ich bin mude|mude)\b/, say: ["Kenn ich, bin auch müde.", "Ja, ich auch irgendwie.", "Dann schlaf bald, ist ja wichtig."] }
+    ];
+    const TOPIC_RE = {
+      musik: /\b(musik|lied|song|hoerst|horst|band|rapper|sanger|spotify|playlist)\w*/,
+      sport: /\b(sport|fussball|verein|training|basketball|schwimm\w*|joggen|inliner)\b/,
+      serien: /\b(serie|serien|film\w*|youtube|netflix|anime|youtuber)\b/,
+      tiere: /\b(tier\w*|hund\w*|katze\w*|haustier|pferd\w*)\b/,
+      essen: /\b(essen|pizza|lieblingsessen|nudel\w*|burger|pommes|kochen|eis)\b/
+    };
+    const POS_RE = /\b(super|toll|geil|mega|nice|cool|freut mich|gut|lustig)\b/;
+    const NEG_RE = /\b(schade|doof|schlecht|blod|nervig|anstrengend|traurig|stress)\b/;
+    // Jede Zeile kommt pro Chat höchstens einmal vor
+    let usedLines = new Set();
+    function pickFresh(arr) {
+      if (!arr || !arr.length) return null;
+      const fresh = arr.filter(x => !usedLines.has(x));
+      const choice = pick(fresh.length ? fresh : arr);
+      usedLines.add(choice);
+      return choice;
+    }
+    function nameGame(text) {
+      const norm = normalize(text);
+      for (const g of GAMES) if (norm.includes(g)) return g;
+      return null;
+    }
+    // Reaktion auf das, was das Kind gesagt hat (nur Kleingespräch, keine neuen Themen)
+    function reactToContent(text) {
+      const norm = normalize(text);
+      const game = nameGame(text);
+      if (game) {
+        const mine = normalize(persona.game);
+        if (norm.includes(mine)) return pickFresh(["Echt? Ich spiele auch " + persona.game + "!", "Cool, " + persona.game + " mag ich auch.", "Ah, dann haben wir dasselbe Spiel."]);
+        const nice = game.replace(/\b\w/g, c => c.toUpperCase());
+        return pickFresh(["Ah, " + nice + ". Hab ich schon mal gesehen.", nice + " kenne ich, ist bestimmt lustig.", "Cool, " + nice + " hab ich noch nie richtig gespielt."]);
+      }
+      if (NEG_RE.test(norm)) return pickFresh(ACKS_NEG);
+      if (POS_RE.test(norm)) return pickFresh(ACKS_POS);
+      return null;
+    }
+    // Merkt sich pro Nachricht das Ergebnis, damit mehrfache Aufrufe nicht mehrere Zeilen verbrauchen
+    let qMemo = { key: null, res: null };
+    function answerSmallTalk(text, norm, isQ) {
+      const list = isQ ? SMALLTALK.concat(SMALLTALK_NOQ) : SMALLTALK_NOQ.concat(SMALLTALK);
+      for (const t of list) {
+        if (t.re.test(norm)) return { type: "chat", text: pickFresh(t.say) };
+      }
+      return null;
+    }
     // Echte Abwehr (nicht bloß "kein Interesse am Thema")
     const RE_HARD_REFUSE = /\b(block\w*|polizei|hau ab|geh weg|verschwinde|du nerv\w*|nerv mich|stopp|stop|geht dich nichts an|auf keinen fall|gruselig|unangenehm|tschuss|tschau|ciao|bye|lass (mich|das|es|bitte)|nie wieder|niemals|unterlass\w*)\b/;
     const RE_NO_INTEREST = /\b(nicht|kaum|nie|nix|nichts|kein\w*|keine)\b/;
-    const RETREAT_ACKS = ["Okay, alles gut.", "Ok, kein Stress.", "Alles klar.", "Schon gut."];
+    const RETREAT_ACKS = ["Okay, alles gut.", "Ok, kein Stress.", "Alles klar.", "Schon gut.", "Sorry, war nicht so gemeint.", "Ok, vergiss es.", "Kein Ding, ich frag nicht mehr."];
 
     function lastBotCard() {
       const last = [...conversation].reverse().find(i => i.who === "bot");
@@ -977,8 +1091,13 @@
     function answerEcho(text) {
       const norm = normalize(text);
       const card = lastBotCard();
-      if (/(^| )und (du|bei dir|dir)( so)?$/.test(norm) && card && card.phase === 0) {
-        return { type: "fact", text: pick(["Am liebsten spiele ich " + persona.game + ".", "Meistens " + persona.game + "."]) };
+      if (/(^| )und (du|bei dir|dir|selbst)( so)?$/.test(norm) && card && card.phase === 0) {
+        const topic = card.topic || "gaming";
+        if (topic === "gaming") {
+          return { type: "fact", text: pickFresh(["Am liebsten spiele ich " + persona.game + ".", "Meistens " + persona.game + ".", "Hauptsächlich " + persona.game + "."]) };
+        }
+        const f = pickFresh(TOPIC_FACTS[topic] || []);
+        if (f) return { type: "fact", text: f };
       }
       return null;
     }
@@ -1074,6 +1193,101 @@
       return "advance";
     }
 
+
+    /* ==================================================================
+       Leichter Textabgleich (ersetzt das große Sprachmodell als Standard)
+       - Wortgruppen: "foto/pic/selfie" zählen als dasselbe Thema, ebenso "treffen/vorbeikommen" usw.
+       - Zeichen-Dreier (Trigramme): verträgt Tippfehler und Slang
+       - Gewichtung wie beim Sprachmodell: aktuelle Antwort, frühere Antworten, letzte Figur-Nachricht
+       - Abzug für Karten, die den letzten Figur-Nachrichten zu ähnlich sind
+       Braucht nur wenige KB Speicher und keinen Download.
+       ================================================================== */
+    const STOP = new Set(("und oder aber auch noch nur mal doch dann denn wenn weil dass das der die den dem des ein eine einen einem einer " +
+      "ich du er sie es wir ihr mein dein sein bin bist ist sind war hab habe hast hat will willst kann kannst muss mach machst " +
+      "wie was wer wo wann warum wieso mit von fur auf aus bei nach zum zur ins uns dir mir mich dich sich nicht kein keine ja nein " +
+      "ganz sehr schon gerade immer jetzt hier dort da so ok okay halt eher eigentlich vielleicht").split(" "));
+    const CONCEPT_LIST = [
+      ["spiel","game"],["zock","game"],["game","game"],["gaming","game"],["dadel","game"],["level","game"],["server","game"],["rang","game"],
+      ["minecraft","game"],["roblox","game"],["fortnite","game"],["fifa","game"],["brawl","game"],["clash","game"],["pokemon","game"],
+      ["foto","foto"],["bild","foto"],["pic","foto"],["selfie","foto"],["video","foto"],["cam","foto"],["kamera","foto"],
+      ["treff","treffen"],["sehen","treffen"],["vorbei","treffen"],["abhol","treffen"],["park","treffen"],["bahnhof","treffen"],["persoenlich","treffen"],
+      ["geheim","geheim"],["niemand","geheim"],["verrat","geheim"],["vertrau","geheim"],["unter uns","geheim"],["ehrlich","geheim"],
+      ["eltern","eltern"],["mama","eltern"],["papa","eltern"],["mutter","eltern"],["vater","eltern"],["erwachsen","eltern"],
+      ["allein","allein"],["zuhause","allein"],["hause","allein"],["wohnung","allein"],["sturmfrei","allein"],
+      ["schule","schule"],["klasse","schule"],["lehrer","schule"],["hausaufgab","schule"],["pause","schule"],
+      ["app","app"],["snap","app"],["insta","app"],["whatsapp","app"],["discord","app"],["tiktok","app"],["telegram","app"],["chat","app"],["wechsel","app"],["nummer","app"],
+      ["freund","freunde"],["kumpel","freunde"],["clique","freunde"],["gruppe","freunde"],["clan","freunde"],
+      ["einsam","gefuehl"],["traurig","gefuehl"],["langweil","gefuehl"],["stress","gefuehl"],["aerger","gefuehl"],["verstehe","gefuehl"],
+      ["geschenk","geschenk"],["geld","geschenk"],["skin","geschenk"],["robux","geschenk"],["vbucks","geschenk"],["gutschein","geschenk"],["schenk","geschenk"],["gratis","geschenk"],
+      ["hubsch","kompliment"],["huebsch","kompliment"],["schon","kompliment"],["suess","kompliment"],["klug","kompliment"],["reif","kompliment"],["besonder","kompliment"],["cool","kompliment"],
+      ["alt","alter"],["jahre","alter"],["alter","alter"],
+      ["wohn","ort"],["stadt","ort"],["strasse","ort"],["adresse","ort"],["dorf","ort"],["viertel","ort"],
+      ["musik","musik"],["lied","musik"],["song","musik"],["rap","musik"],["pop","musik"],
+      ["sport","sport"],["fussball","sport"],["training","sport"],["verein","sport"],
+      ["serie","serien"],["film","serien"],["youtube","serien"],["anime","serien"],
+      ["hund","tiere"],["katze","tiere"],["tier","tiere"],["pferd","tiere"],
+      ["pizza","essen"],["nudel","essen"],["essen","essen"],["burger","essen"]
+    ];
+    function conceptsOf(text) {
+      const set = new Set();
+      const norm = normalize(text);
+      for (const w of norm.split(" ")) {
+        if (w.length < 3) continue;
+        for (const [stem, c] of CONCEPT_LIST) if (w.startsWith(stem)) set.add(c);
+      }
+      for (const [stem, c] of CONCEPT_LIST) if (stem.includes(" ") && norm.includes(stem)) set.add(c);
+      return set;
+    }
+    function gramVec(text) {
+      const m = new Map();
+      for (const w of normalize(text).split(" ")) {
+        if (w.length < 4 || STOP.has(w)) continue;
+        const p = " " + w + " ";
+        for (let i = 0; i + 3 <= p.length; i++) { const g = p.substr(i, 3); m.set(g, (m.get(g) || 0) + 1); }
+      }
+      let s = 0; for (const v of m.values()) s += v * v;
+      m._n = Math.sqrt(s) || 1;
+      return m;
+    }
+    function cosG(a, b) {
+      if (!a.size || !b.size) return 0;
+      const [s, l] = a.size < b.size ? [a, b] : [b, a];
+      let d = 0;
+      for (const [g, v] of s) { const u = l.get(g); if (u) d += v * u; }
+      return d / (a._n * b._n);
+    }
+    // Pro Karte nur einmal berechnen (spart Rechenzeit; ein paar KB insgesamt)
+    function cardTokens(c) { return c._ts || (c._ts = tokenSet(c.text)); }
+    function cardGrams(c)  { return c._gv || (c._gv = gramVec(c.text + " " + (c.keywords || []).join(" "))); }
+    function cardConcepts(c) { return c._cc || (c._cc = conceptsOf(c.text + " " + (c.keywords || []).join(" "))); }
+    function setOverlap(a, b) {
+      if (!a.size || !b.size) return 0;
+      let n = 0; for (const x of a) if (b.has(x)) n++;
+      return n / Math.min(a.size, b.size);
+    }
+
+    function lexRank(pool, replyText, lastBotText, step) {
+      const replies = recentReplies(3).map(r => r.text);
+      const nowTxt = replyText || "";
+      const earlierTxt = replies.slice(0, -1).join(" ");
+      const qNow = gramVec(nowTxt), qEarly = gramVec(earlierTxt), qLast = gramVec(lastBotText || "");
+      const cNow = conceptsOf(nowTxt), cEarly = conceptsOf(earlierTxt);
+      const olderBot = conversation.filter(i => i.who === "bot" && !i.hint).slice(-3).map(i => gramVec(i.text));
+      const now = tokenSet(nowTxt);
+      const hit = (kw) => { const k = normalize(kw); return k && [...now].some(w => w.startsWith(k) || k.startsWith(w)); };
+
+      const scored = pool.map(c => {
+        const g = cardGrams(c), cc = cardConcepts(c);
+        let s = 0.45 * cosG(qNow, g) + 0.15 * cosG(qEarly, g) + 0.35 * cosG(qLast, g);
+        s += 0.30 * setOverlap(cNow, cc) + 0.10 * setOverlap(cEarly, cc);
+        s += 0.12 * (c.keywords || []).filter(hit).length;
+        if (olderBot.length) s -= 0.35 * Math.max(...olderBot.map(q => cosG(q, g)));
+        return { c, s: s + Math.random() * 0.04 };   // kleines Rauschen, damit nicht immer dieselbe Karte gewinnt
+      }).sort((a, b) => b.s - a.s);
+      // Aus den besten drei zufällig, damit die Figur abwechslungsreich bleibt
+      return shuffle(scored.slice(0, 3)).map(x => x.c);
+    }
+
     /* ---------- Auswahl der nächsten Nachricht ---------- */
 
     let lastPickInfo = null;
@@ -1086,7 +1300,7 @@
 
       let pool = base.filter(c =>
         !usedIds.has(c.id) &&
-        !usedTokenSets.some(ts => jaccard(tokenSet(c.text), ts) >= 0.5)
+        !usedTokenSets.some(ts => jaccard(cardTokens(c), ts) >= 0.5)
       );
 
       // Wenn der Abschnitt leer ist, geht die Figur lieber einen Abschnitt zurück, statt Nachrichten zu wiederholen
@@ -1094,7 +1308,7 @@
       if (!pool.length && !step.strategy && step.phase > 0) {
         for (let p = step.phase - 1; p >= 0 && !pool.length; p--) {
           pool = answerBank.filter(c => c.phase === p && !usedIds.has(c.id) && !st.missed.has(c.topic || "gaming") &&
-            !usedTokenSets.some(ts => jaccard(tokenSet(c.text), ts) >= 0.5));
+            !usedTokenSets.some(ts => jaccard(cardTokens(c), ts) >= 0.5));
           if (pool.length) fellBackTo = p;
         }
       }
@@ -1158,14 +1372,8 @@
         }
       }
       if (!order.length) {
-        // Ohne Sprachmodell: Karten bevorzugen, deren Schlagwörter in den letzten drei Antworten vorkommen
-        const now = tokenSet(replyText || "");
-        const before = tokenSet(recentReplies(3).slice(0, -1).map(r => r.text).join(" "));
-        const hit = (kw, words) => { const k = normalize(kw); return k && [...words].some(w => w.startsWith(k) || k.startsWith(w)); };
-        const scored = shuffle(pool).map(c => ({
-          c, s: (c.keywords || []).reduce((n, kw) => n + (hit(kw, now) ? 2 : 0) + (hit(kw, before) ? 1 : 0), 0)
-        })).sort((a, b) => b.s - a.s);
-        order = shuffle(scored.slice(0, 3)).map(x => x.c);
+        // Ohne Sprachmodell: leichter Textabgleich (Wortstämme, Wortgruppen, Zeichen-Dreier)
+        order = lexRank(pool, replyText, lastBotText, step);
       }
       card = order[0];
 
@@ -1303,6 +1511,8 @@
       conversation = [];
       usedIds = new Set();
       usedTokenSets = [];
+      usedLines = new Set();
+      qMemo = { key: null, res: null };
 
       $("log").innerHTML = "";
       $("pairs").innerHTML = "";
@@ -1376,10 +1586,15 @@
       if (me.ben !== "left" && res.intent !== "refuse" && res.intent !== "insult") {
         const q = q0;
         let said = null;
-        if (me.ben === "topic") { said = pick(TOPIC_ACKS); me.ack = said; }
+        if (me.ben === "topic") { said = pickFresh(TOPIC_ACKS); me.ack = said; }
         else if (q && q.type === "fact") { said = q.text; me.fact = q.text; }
+        else if (q && q.type === "chat") { said = q.text; me.ack = said; }
         else if (q && q.type === "dodge") { me.dodged = true; }
-        else if (res.intent === "soft" && !isQuestionText(text) && st.phase <= 1 && Math.random() < 0.6) { said = pick(ACKS); me.ack = said; }
+        else if ((res.intent === "soft" || res.intent === "comply") && !isQuestionText(text) && st.phase <= 1) {
+          // Erst auf den Inhalt eingehen (Spielname, Stimmung), sonst mit Wahrscheinlichkeit ein kurzes Okay
+          said = reactToContent(text) || (Math.random() < 0.55 ? pickFresh(ACKS) : null);
+          if (said) me.ack = said;
+        }
         if (said) {
           typingNow.remove();
           await sleep(300);
@@ -1402,7 +1617,7 @@
         st.pendingQ = null;   // Kein Fragesatz → Slate sauber
       }
       if (me.ben === "back" && !spoke) {
-        const said = pick(RETREAT_ACKS);
+        const said = pickFresh(RETREAT_ACKS);
         me.ack = said;
         typingNow.remove();
         await sleep(300);
@@ -1795,6 +2010,7 @@
         const scriptEl = $("answer-bank-json");
         if (scriptEl && scriptEl.textContent.trim().length > 10) {
           const data = JSON.parse(scriptEl.textContent);
+          scriptEl.remove();   // Rohtext (~330 KB) nicht doppelt im Speicher halten
           if (Array.isArray(data) && data.length > 100) { answerBank = data; return; }
         }
       } catch (err) {
@@ -1823,7 +2039,7 @@
         $("start").disabled = true;
         if (!answerBank.length) await loadAnswerBank();
 
-        if (!embedder) {
+        if (USE_EMBEDDER && !embedder) {
           $("loadBox").classList.remove("hidden");
           setLoadProgress(2, "Sprachmodell wird geladen …");
           const skip = new Promise(r => { skipResolve = r; });
